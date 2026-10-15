@@ -11,6 +11,7 @@ concurrency:
 
 jobs:
   check_code_quality:
+    timeout-minutes: 60
     runs-on: ubuntu-22.04
     steps:
       - uses: actions/checkout@v3
