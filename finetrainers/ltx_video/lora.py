@@ -4,12 +4,12 @@ import torch
 import torch.nn as nn
 from accelerate.logging import get_logger
 from diffusers import AutoencoderKLLTXVideo, FlowMatchEulerDiscreteScheduler, LTXPipeline, LTXVideoTransformer3DModel
+from finetrainers.conditioning.LTXVideoConditionedTransformer3DModel import LTXVideoConditionedTransformer3DModel
+from finetrainers.conditioning.conditioned_pipeline import LTXConditionedPipeline
 from PIL import Image
 from transformers import T5EncoderModel, T5Tokenizer
 
-
 logger = get_logger("finetrainers")  # pylint: disable=invalid-name
-
 
 def load_condition_models(
     model_id: str = "Lightricks/LTX-Video",
@@ -37,6 +37,20 @@ def load_latent_models(
     )
     return {"vae": vae}
 
+def load_condition_models(
+    model_id: str = "Lightricks/LTX-Video",
+    text_encoder_dtype: torch.dtype = torch.bfloat16,
+    revision: Optional[str] = None,
+    cache_dir: Optional[str] = None,
+    **kwargs,
+) -> Dict[str, nn.Module]:
+    tokenizer = T5Tokenizer.from_pretrained(model_id, subfolder="tokenizer", revision=revision, cache_dir=cache_dir)
+    text_encoder = T5EncoderModel.from_pretrained(
+        model_id, subfolder="text_encoder", torch_dtype=text_encoder_dtype, revision=revision, cache_dir=cache_dir
+    )
+    return {"tokenizer": tokenizer, "text_encoder": text_encoder}
+
+
 
 def load_diffusion_models(
     model_id: str = "Lightricks/LTX-Video",
@@ -52,6 +66,7 @@ def load_diffusion_models(
     return {"transformer": transformer, "scheduler": scheduler}
 
 
+    
 def initialize_pipeline(
     model_id: str = "Lightricks/LTX-Video",
     text_encoder_dtype: torch.dtype = torch.bfloat16,
@@ -138,6 +153,7 @@ def prepare_latents(
     image_or_video = image_or_video.permute(0, 2, 1, 3, 4).contiguous()  # [B, C, F, H, W] -> [B, F, C, H, W]
     if not precompute:
         latents = vae.encode(image_or_video).latent_dist.sample(generator=generator)
+
         latents = latents.to(dtype=dtype)
         _, _, num_frames, height, width = latents.shape
         latents = _normalize_latents(latents, vae.latents_mean, vae.latents_std)
@@ -185,6 +201,7 @@ def collate_fn_t2v(batch: List[List[Dict[str, torch.Tensor]]]) -> Dict[str, torc
         "prompts": [x["prompt"] for x in batch[0]],
         "videos": torch.stack([x["video"] for x in batch[0]]),
     }
+
 
 
 def forward_pass(
@@ -294,6 +311,11 @@ def _pack_latents(latents: torch.Tensor, patch_size: int = 1, patch_size_t: int 
     post_patch_num_frames = num_frames // patch_size_t
     post_patch_height = height // patch_size
     post_patch_width = width // patch_size
+
+    dim1 = num_frames // patch_size_t * height // patch_size * width // patch_size
+    dim2 = num_channels * patch_size_t * patch_size * patch_size
+
+
     latents = latents.reshape(
         batch_size,
         -1,

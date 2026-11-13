@@ -50,13 +50,17 @@ class ImageOrVideoDataset(Dataset):
         dataset_file: Optional[str] = None,
         id_token: Optional[str] = None,
         remove_llm_prefixes: bool = False,
+        pose_column: str = None,
     ) -> None:
         super().__init__()
 
         self.data_root = Path(data_root)
         self.dataset_file = dataset_file
+
         self.caption_column = caption_column
         self.video_column = video_column
+        self.pose_column = pose_column
+
         self.id_token = f"{id_token.strip()} " if id_token else ""
         self.resolution_buckets = resolution_buckets
 
@@ -72,6 +76,7 @@ class ImageOrVideoDataset(Dataset):
             (
                 self.prompts,
                 self.video_paths,
+                self.pose_paths,
             ) = self._load_dataset_from_local_path()
         elif dataset_file.endswith(".csv"):
             (
@@ -139,17 +144,33 @@ class ImageOrVideoDataset(Dataset):
         if video_path.suffix.lower() in [".png", ".jpg", ".jpeg"]:
             video = self._preprocess_image(video_path)
         else:
-            video = self._preprocess_video(video_path)
+            video,_ = self._preprocess_video(video_path)
 
-        return {
-            "prompt": prompt,
-            "video": video,
-            "video_metadata": {
-                "num_frames": video.shape[0],
-                "height": video.shape[2],
-                "width": video.shape[3],
-            },
-        }
+        if self.pose_column != None:
+            pose,num_frames = self._preprocess_video(self.pose_paths[index])
+            img_ref = self._preprocess_video_image_reference_video(video_path,num_frames)
+
+            return {
+                "prompt": prompt,
+                "video": video,
+                "pose": pose,
+                "img_ref": img_ref,
+                "video_metadata": {
+                    "num_frames": video.shape[0],
+                    "height": video.shape[2],
+                    "width": video.shape[3],
+                },
+            }
+        else:
+            return {
+                "prompt": prompt,
+                "video": video,
+                "video_metadata": {
+                    "num_frames": video.shape[0],
+                    "height": video.shape[2],
+                    "width": video.shape[3],
+                },
+            }
 
     def _load_dataset_from_local_path(self) -> Tuple[List[str], List[str]]:
         if not self.data_root.exists():
@@ -157,6 +178,19 @@ class ImageOrVideoDataset(Dataset):
 
         prompt_path = self.data_root.joinpath(self.caption_column)
         video_path = self.data_root.joinpath(self.video_column)
+
+        if self.pose_column != None:
+            pose_path = self.data_root.joinpath(self.pose_column)
+            pose_conditioning = True
+
+            if not pose_path.exists() or not pose_path.is_file() or not self.pose_column:
+                pose_conditioning = False
+
+            if pose_conditioning:
+                with open(pose_path, "r", encoding="utf-8") as file:
+                    pose_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
+        else:
+            pose_paths = None 
 
         if not prompt_path.exists() or not prompt_path.is_file():
             raise ValueError(
@@ -172,12 +206,14 @@ class ImageOrVideoDataset(Dataset):
         with open(video_path, "r", encoding="utf-8") as file:
             video_paths = [self.data_root.joinpath(line.strip()) for line in file.readlines() if len(line.strip()) > 0]
 
+       
+
         if any(not path.is_file() for path in video_paths):
             raise ValueError(
                 f"Expected `{self.video_column=}` to be a path to a file in `{self.data_root=}` containing line-separated paths to video data but found atleast one path that is not a valid file."
             )
 
-        return prompts, video_paths
+        return prompts, video_paths, pose_paths
 
     def _load_dataset_from_csv(self) -> Tuple[List[str], List[str]]:
         df = pd.read_csv(self.dataset_file)
@@ -242,8 +278,32 @@ class ImageOrVideoDataset(Dataset):
         frames = frames[: self.max_num_frames].float()
         frames = frames.permute(0, 3, 1, 2).contiguous()
         frames = torch.stack([self.video_transforms(frame) for frame in frames], dim=0)
-        return frames
+        return frames,len(frames)
+    
+    # use the frame_length of the pose video.
+    def _preprocess_video_image_reference_video(self, path: Path,frame_length:int) -> torch.Tensor:
+        video_reader = decord.VideoReader(uri=path.as_posix())
 
+        video_num_frames = len(video_reader)
+        # nearest_frame_bucket = min(
+        #     [bucket for bucket in self.resolution_buckets if bucket[0] <= video_num_frames],
+        #     key=lambda x: abs(x[0] - min(video_num_frames, self.max_num_frames)),
+        #     default=1,
+        # )[0]
+
+        frame_indices = [0 for _ in range(frame_length)]
+        frames = video_reader.get_batch(frame_indices)
+        # frames = frames[:nearest_frame_bucket].float()
+
+        frames = frames.permute(0, 3, 1, 2).contiguous()
+
+        # nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+        # frames_resized = torch.stack([resize(frame, nearest_res) for frame in frames], dim=0)
+        # frames = torch.stack([self.video_transforms(frame) for frame in frames_resized], dim=0)
+        # torch.Size([96, 3, 512, 768])
+        frames = torch.stack([self.video_transforms(frame) for frame in frames], dim=0)
+
+        return frames
 
 class ImageOrVideoDatasetWithResizing(ImageOrVideoDataset):
     def __init__(self, *args, **kwargs) -> None:
@@ -282,7 +342,7 @@ class ImageOrVideoDatasetWithResizing(ImageOrVideoDataset):
         frames_resized = torch.stack([resize(frame, nearest_res) for frame in frames], dim=0)
         frames = torch.stack([self.video_transforms(frame) for frame in frames_resized], dim=0)
 
-        return frames
+        return frames,len(frames)
 
     def _find_nearest_resolution(self, height, width):
         nearest_res = min(self.resolution_buckets, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
@@ -329,6 +389,7 @@ class ImageOrVideoDatasetWithResizeAndRectangleCrop(ImageOrVideoDataset):
 
     def _preprocess_video(self, path: Path) -> torch.Tensor:
         video_reader = decord.VideoReader(uri=path.as_posix())
+        
         video_num_frames = len(video_reader)
         nearest_frame_bucket = min(
             [bucket for bucket in self.resolution_buckets if bucket <= video_num_frames],

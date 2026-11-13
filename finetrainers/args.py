@@ -249,6 +249,8 @@ class Args:
     dataset_file: Optional[str] = None
     video_column: str = None
     caption_column: str = None
+    pose_column:str = None
+    
     id_token: Optional[str] = None
     image_resolution_buckets: List[Tuple[int, int]] = None
     video_resolution_buckets: List[Tuple[int, int, int]] = None
@@ -314,6 +316,11 @@ class Args:
     validation_prompts: List[str] = None
     validation_images: List[str] = None
     validation_videos: List[str] = None
+
+    # Condition
+    validation_pose_videos: List[str] = None
+    validation_img_ref_videos: List[str] = None
+    
     validation_heights: List[int] = None
     validation_widths: List[int] = None
     validation_num_frames: List[int] = None
@@ -353,6 +360,7 @@ class Args:
                 "dataset_file": self.dataset_file,
                 "video_column": self.video_column,
                 "caption_column": self.caption_column,
+                "pose_column": self.pose_column,
                 "id_token": self.id_token,
                 "image_resolution_buckets": self.image_resolution_buckets,
                 "video_resolution_buckets": self.video_resolution_buckets,
@@ -548,6 +556,12 @@ def _add_dataset_arguments(parser: argparse.ArgumentParser) -> None:
         "--caption_column",
         type=str,
         default="text",
+        help="The column of the dataset containing the instance prompt for each video. Or, the name of the file in `--data_root` folder containing the line-separated instance prompts.",
+    )
+    parser.add_argument(
+        "--pose_column",
+        type=str,
+        default=None,
         help="The column of the dataset containing the instance prompt for each video. Or, the name of the file in `--data_root` folder containing the line-separated instance prompts.",
     )
     parser.add_argument(
@@ -870,6 +884,21 @@ def _add_validation_arguments(parser: argparse.ArgumentParser) -> None:
         default=None,
         help="One or more image path(s)/URLs that is used during validation to verify that the model is learning. Multiple validation paths should be separated by the '--validation_prompt_seperator' string. These should correspond to the order of the validation prompts.",
     )
+    
+    parser.add_argument(
+        "--validation_pose_videos",
+        type=str,
+        default=None,
+        help="One or more pose_videos path(s)/URLs that is used during validation to verify that the model is learning. Multiple validation paths should be separated by the '--validation_prompt_seperator' string. These should correspond to the order of the validation prompts.",
+    )
+
+    parser.add_argument(
+        "--validation_img_ref_videos",
+        type=str,
+        default=None,
+        help="One or more img_ref video or img will just take the first frame and create a video from it path(s)/URLs that is used during validation to verify that the model is learning. Multiple validation paths should be separated by the '--validation_prompt_seperator' string. These should correspond to the order of the validation prompts.",
+    )
+
     parser.add_argument(
         "--validation_videos",
         type=str,
@@ -1006,6 +1035,7 @@ def _map_to_args_type(args: Dict[str, Any]) -> Args:
     result_args.dataset_file = args.dataset_file
     result_args.video_column = args.video_column
     result_args.caption_column = args.caption_column
+    result_args.pose_column = args.pose_column
     result_args.id_token = args.id_token
     result_args.image_resolution_buckets = args.image_resolution_buckets or DEFAULT_IMAGE_RESOLUTION_BUCKETS
     result_args.video_resolution_buckets = args.video_resolution_buckets or DEFAULT_VIDEO_RESOLUTION_BUCKETS
@@ -1069,6 +1099,12 @@ def _map_to_args_type(args: Dict[str, Any]) -> Args:
     validation_prompts = args.validation_prompts.split(args.validation_separator) if args.validation_prompts else []
     validation_images = args.validation_images.split(args.validation_separator) if args.validation_images else None
     validation_videos = args.validation_videos.split(args.validation_separator) if args.validation_videos else None
+    
+    # extend with pose conditioning ...
+    validation_pose_videos = args.validation_pose_videos.split(args.validation_separator) if args.validation_pose_videos else None
+    validation_img_ref_videos = args.validation_img_ref_videos.split(args.validation_separator) if args.validation_img_ref_videos else None
+
+
     stripped_validation_prompts = []
     validation_heights = []
     validation_widths = []
@@ -1097,6 +1133,10 @@ def _map_to_args_type(args: Dict[str, Any]) -> Args:
     result_args.validation_images = validation_images
     result_args.validation_videos = validation_videos
 
+    # extend with pose conditioning ...
+    result_args.validation_pose_videos = validation_pose_videos
+    result_args.validation_img_ref_videos = validation_img_ref_videos
+    
     result_args.num_validation_videos_per_prompt = args.num_validation_videos
     result_args.validation_every_n_epochs = args.validation_epochs
     result_args.validation_every_n_steps = args.validation_steps

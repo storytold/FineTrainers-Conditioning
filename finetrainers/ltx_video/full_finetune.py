@@ -1,4 +1,5 @@
 from diffusers import LTXPipeline
+from finetrainers.conditioning.conditioned_pipeline import LTXConditionedPipeline
 
 from .lora import (
     collate_fn_t2v,
@@ -12,7 +13,6 @@ from .lora import (
     prepare_latents,
     validation,
 )
-
 
 # TODO(aryan): refactor into model specs for better re-use
 LTX_VIDEO_T2V_FULL_FINETUNE_CONFIG = {

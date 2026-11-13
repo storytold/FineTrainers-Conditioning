@@ -6,7 +6,7 @@ import random
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import Any, Dict, List
-
+from finetrainers.dataset import ImageOrVideoDataset
 import diffusers
 import torch
 import torch.backends
@@ -21,6 +21,10 @@ from accelerate.utils import (
     gather_object,
     set_seed,
 )
+import decord
+from typing import Tuple,Optional
+
+
 from diffusers import DiffusionPipeline
 from diffusers.configuration_utils import FrozenDict
 from diffusers.models.autoencoders.vae import DiagonalGaussianDistribution
@@ -57,7 +61,7 @@ from .utils.model_utils import resolve_vae_cls_from_ckpt_path
 from .utils.optimizer_utils import get_optimizer
 from .utils.torch_utils import align_device_and_dtype, expand_tensor_dims, unwrap_model
 
-
+from .conditioning import condition_latents_prepare,post_conditioned_latent_patchify
 logger = get_logger("finetrainers")
 logger.setLevel(FINETRAINERS_LOG_LEVEL)
 
@@ -100,19 +104,34 @@ class Trainer:
         self.state.model_name = self.args.model_name
         self.model_config = get_config_from_model_name(self.args.model_name, self.args.training_type)
 
+        self.pose_condition = False
+        if self.args.pose_column != None:
+            self.pose_condition = True
+
+
     def prepare_dataset(self) -> None:
         # TODO(aryan): Make a background process for fetching
         logger.info("Initializing dataset and dataloader")
-
-        self.dataset = ImageOrVideoDatasetWithResizing(
-            data_root=self.args.data_root,
-            caption_column=self.args.caption_column,
-            video_column=self.args.video_column,
-            resolution_buckets=self.args.video_resolution_buckets,
-            dataset_file=self.args.dataset_file,
-            id_token=self.args.id_token,
-            remove_llm_prefixes=self.args.remove_common_llm_caption_prefixes,
-        )
+        if self.pose_condition == True:
+            self.dataset = ImageOrVideoDatasetWithResizing(
+                data_root=self.args.data_root,
+                caption_column=self.args.caption_column,
+                video_column=self.args.video_column,
+                pose_column=self.args.pose_column,
+                resolution_buckets=self.args.video_resolution_buckets,
+                dataset_file=self.args.dataset_file,
+                id_token=self.args.id_token,
+            )
+        else:
+            self.dataset = ImageOrVideoDatasetWithResizing(
+                data_root=self.args.data_root,
+                caption_column=self.args.caption_column,
+                video_column=self.args.video_column,
+                resolution_buckets=self.args.video_resolution_buckets,
+                dataset_file=self.args.dataset_file,
+                id_token=self.args.id_token,
+                remove_llm_prefixes=self.args.remove_common_llm_caption_prefixes,
+            )
         self.dataloader = torch.utils.data.DataLoader(
             self.dataset,
             batch_size=1,
@@ -130,12 +149,14 @@ class Trainer:
         if not self.args.precompute_conditions:
             condition_components = self.model_config["load_condition_models"](**load_components_kwargs)
             latent_components = self.model_config["load_latent_models"](**load_components_kwargs)
-            diffusion_components = self.model_config["load_diffusion_models"](**load_components_kwargs)
+            # bug
+            #diffusion_components = self.model_config["load_diffusion_models"](**load_components_kwargs)
 
         components = {}
         components.update(condition_components)
         components.update(latent_components)
-        components.update(diffusion_components)
+        #bug
+        #components.update(diffusion_components)
         self._set_components(components)
 
         if self.vae is not None:
@@ -309,7 +330,7 @@ class Trainer:
     def prepare_trainable_parameters(self) -> None:
         logger.info("Initializing trainable parameters")
 
-        diffusion_components = self.model_config["load_diffusion_models"](**self._get_load_components_kwargs())
+        diffusion_components = self.model_config["load_diffusion_models"](output_dir=self.args.output_dir,**self._get_load_components_kwargs())
         self._set_components(diffusion_components)
 
         components = [self.text_encoder, self.text_encoder_2, self.text_encoder_3, self.vae]
@@ -647,21 +668,38 @@ class Trainer:
                     if not self.args.precompute_conditions:
                         videos = batch["videos"]
                         prompts = batch["prompts"]
+
+                        if self.pose_condition == True:
+                            poses = batch["poses"]
+                            # generate video across all frames
+                            img_refs = batch["img_refs"]
+
                         batch_size = len(prompts)
 
                         if self.args.caption_dropout_technique == "empty":
                             if random.random() < self.args.caption_dropout_p:
                                 prompts = [""] * batch_size
-
-                        latent_conditions = self.model_config["prepare_latents"](
-                            vae=self.vae,
-                            image_or_video=videos,
-                            patch_size=self.transformer_config.patch_size,
-                            patch_size_t=self.transformer_config.patch_size_t,
-                            device=accelerator.device,
-                            dtype=weight_dtype,
-                            generator=self.state.generator,
-                        )
+                        if self.pose_condition == True:
+                            # this is vae output of target video
+                            latent_conditions = condition_latents_prepare.prepare_latents_for_conditioning(
+                                vae=self.vae,
+                                image_or_video=videos,
+                                patch_size=self.transformer_config.patch_size,
+                                patch_size_t=self.transformer_config.patch_size_t,
+                                device=accelerator.device,
+                                dtype=weight_dtype,
+                                generator=self.state.generator,
+                            )
+                        else:
+                            latent_conditions = self.model_config["prepare_latents"](
+                                vae=self.vae,
+                                image_or_video=videos,
+                                patch_size=self.transformer_config.patch_size,
+                                patch_size_t=self.transformer_config.patch_size_t,
+                                device=accelerator.device,
+                                dtype=weight_dtype,
+                                generator=self.state.generator,
+                            )
                         text_conditions = self.model_config["prepare_conditions"](
                             tokenizer=self.tokenizer,
                             text_encoder=self.text_encoder,
@@ -691,6 +729,34 @@ class Trainer:
                         batch_size = latent_conditions["latents"].shape[0]
 
                     latent_conditions = make_contiguous(latent_conditions)
+
+                    if self.pose_condition:
+                        # Pose Template VAE.
+                        pose_video_latents = condition_latents_prepare.prepare_latents_for_conditioning(
+                                vae=self.vae,
+                                image_or_video=poses,
+                                patch_size=self.transformer_config.patch_size,
+                                patch_size_t=self.transformer_config.patch_size_t,
+                                device=accelerator.device,
+                                dtype=weight_dtype,
+                                generator=self.state.generator,
+                            )
+
+                        pose_video_latents = make_contiguous(pose_video_latents)
+
+                        # Image Ref VAE.
+                        img_refs_latents = condition_latents_prepare.prepare_latents_for_conditioning(
+                                vae=self.vae,
+                                image_or_video=img_refs,
+                                patch_size=self.transformer_config.patch_size,
+                                patch_size_t=self.transformer_config.patch_size_t,
+                                device=accelerator.device,
+                                dtype=weight_dtype,
+                                generator=self.state.generator,
+                            )
+
+                        img_refs_latents = make_contiguous(img_refs_latents)
+
                     text_conditions = make_contiguous(text_conditions)
 
                     if self.args.caption_dropout_technique == "zero":
@@ -714,14 +780,16 @@ class Trainer:
                         device=accelerator.device,
                         generator=self.state.generator,
                     )
-                    timesteps = (sigmas * 1000.0).long()
 
+                    timesteps = (sigmas * 1000.0).long()
+                  
                     noise = torch.randn(
                         latent_conditions["latents"].shape,
                         generator=self.state.generator,
                         device=accelerator.device,
                         dtype=weight_dtype,
                     )
+
                     sigmas = expand_tensor_dims(sigmas, ndim=noise.ndim)
 
                     # TODO(aryan): We probably don't need calculate_noisy_latents because we can determine the type of
@@ -734,11 +802,52 @@ class Trainer:
                             timesteps=timesteps,
                         )
                     else:
-                        # Default to flow-matching noise addition
-                        noisy_latents = (1.0 - sigmas) * latent_conditions["latents"] + sigmas * noise
-                        noisy_latents = noisy_latents.to(latent_conditions["latents"].dtype)
+                        if self.pose_condition:
+                            # Note in pose mode all shapes are VAE output shape and not patchified until the end
+                            # condition with the pose information
 
-                    latent_conditions.update({"noisy_latents": noisy_latents})
+                            # normalize and patchify 
+                            # create noise for latent to feed diffusion transformer to get pred noise
+                            target_video_latents = latent_conditions["latents"]
+                            noisy_latents = (1.0 - sigmas) * target_video_latents + sigmas * noise
+                            noisy_latents = noisy_latents.to(target_video_latents.dtype)
+
+                            # add pose information to both channels
+                            pose_noisy_latents = noisy_latents + pose_video_latents["latents"]
+                            pose_img_ref_latents = img_refs_latents["latents"] + pose_video_latents["latents"]
+                            
+                            # expand channel information # B x 2C  latent will be projected to adapter to scale it back to 128d using adapter.
+                            condition_latents = torch.cat([pose_img_ref_latents,pose_noisy_latents], dim=1)
+                            # project this turn into patches
+
+                            # concat tensor
+                            condition_tokens = post_conditioned_latent_patchify(latents=condition_latents,
+                                                                            num_frames=latent_conditions["num_frames"],
+                                                                            height=latent_conditions["height"],
+                                                                            width=latent_conditions["width"],
+                                                                            patch_size = 1,
+                                                                            patch_size_t = 1)
+                            
+                            #  TODO REMOVE target video as a input residual might not need.
+                            noisy_residual_tokens = post_conditioned_latent_patchify(latents=noisy_latents,
+                                                                            num_frames=latent_conditions["num_frames"],
+                                                                            height=latent_conditions["height"],
+                                                                            width=latent_conditions["width"],
+                                                                            patch_size = 1,
+                                                                            patch_size_t = 1)
+                            # Target Latent Patchified concat tensor
+                            # pose template noisey input [cat] img_ref + pose video 
+                            # That dict says latents but actually tokens.
+                            latent_conditions.update({"noisy_latents": condition_tokens["latents"]})
+                            # input video noise at level residual information to adapter
+                            # latent_conditions.update({"noisy_latents_residual":noisy_residual_tokens["latents"]})
+                        else:
+                            # Default to flow-matching noise addition
+                            noisy_latents = (1.0 - sigmas) * latent_conditions["latents"] + sigmas * noise
+                            noisy_latents = noisy_latents.to(latent_conditions["latents"].dtype)
+                            
+                            # this is used for whatever reason to pass into the 
+                            latent_conditions.update({"noisy_latents": noisy_latents})
 
                     weights = prepare_loss_weights(
                         scheduler=self.scheduler,
@@ -748,16 +857,41 @@ class Trainer:
                     )
                     weights = expand_tensor_dims(weights, noise.ndim)
 
-                    pred = self.model_config["forward_pass"](
-                        transformer=self.transformer,
-                        scheduler=self.scheduler,
-                        timesteps=timesteps,
-                        **latent_conditions,
-                        **text_conditions,
-                    )
-                    target = prepare_target(
-                        scheduler=self.scheduler, noise=noise, latents=latent_conditions["latents"]
-                    )
+                    if self.pose_condition:
+                        pred = self.model_config["forward_pass"](
+                            transformer=self.transformer,
+                            scheduler=self.scheduler,
+                            timesteps=timesteps,
+                            **latent_conditions,
+                            **text_conditions,
+                        )
+
+                    else:
+                        pred = self.model_config["forward_pass"](
+                            transformer=self.transformer,
+                            scheduler=self.scheduler,
+                            timesteps=timesteps,
+                            **latent_conditions,
+                            **text_conditions,
+                        )
+                    if self.pose_condition:
+                        target = prepare_target(
+                            scheduler=self.scheduler, noise=noise, latents=latent_conditions["latents"]
+                        )
+
+                    else:
+                        target = prepare_target(
+                            scheduler=self.scheduler, noise=noise, latents=latent_conditions["latents"]
+                        )
+
+                    if self.pose_condition:
+                        # patchify target
+                        target = post_conditioned_latent_patchify(latents=target,
+                                                                            num_frames=latent_conditions["num_frames"],
+                                                                            height=latent_conditions["height"],
+                                                                            width=latent_conditions["width"],
+                                                                            patch_size = 1,
+                                                                            patch_size_t = 1)["latents"]
 
                     loss = weights.float() * (pred["latents"].float() - target.float()).pow(2)
                     # Average loss across all but batch dimension
@@ -888,6 +1022,12 @@ class Trainer:
             prompt = self.args.validation_prompts[i]
             image = self.args.validation_images[i]
             video = self.args.validation_videos[i]
+            # Condition extension
+
+            if self.pose_condition:
+                pose_video = self.args.validation_pose_videos[i]
+                img_ref_video = self.args.validation_img_ref_videos[i]
+
             height = self.args.validation_heights[i]
             width = self.args.validation_widths[i]
             num_frames = self.args.validation_num_frames[i]
@@ -896,26 +1036,53 @@ class Trainer:
                 image = load_image(image)
             if video is not None:
                 video = load_video(video)
-
+            # loading videos for inference ..
+            if self.pose_condition:
+                if pose_video is not None:
+                    pose_video,num_frames = self.dataset._preprocess_video(Path(pose_video)) #self.preprocess_condition_video(pose_video,max_num_frames=self.dataset.max_num_frames)
+                    pose_video = pose_video.unsqueeze(0)
+                if img_ref_video is not None:
+                    img_ref_video = self.dataset._preprocess_video_image_reference_video(Path(img_ref_video),num_frames) #self.preprocess_condition_video_image_reference_video(path=img_ref_video,resolution_buckets=self.dataset.resolution_buckets,max_num_frames=self.dataset.max_num_frames)
+                    img_ref_video = img_ref_video.unsqueeze(0)
             logger.debug(
                 f"Validating sample {i + 1}/{num_validation_samples} on process {accelerator.process_index}. Prompt: {prompt}",
                 main_process_only=False,
             )
-            validation_artifacts = self.model_config["validation"](
-                pipeline=pipeline,
-                prompt=prompt,
-                image=image,
-                video=video,
-                height=height,
-                width=width,
-                num_frames=num_frames,
-                frame_rate=frame_rate,
-                num_videos_per_prompt=self.args.num_validation_videos_per_prompt,
-                generator=torch.Generator(device=accelerator.device).manual_seed(
-                    self.args.seed if self.args.seed is not None else 0
-                ),
-                # todo support passing `fps` for supported pipelines.
-            )
+            
+            if self.pose_condition:
+                validation_artifacts = self.model_config["validation"](
+                    pipeline=pipeline,
+                    prompt=prompt,
+                    image=image,
+                    video=video,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    pose_video=pose_video,
+                    img_ref_video=img_ref_video,
+                    num_videos_per_prompt=self.args.num_validation_videos_per_prompt,
+                    generator=torch.Generator(device=accelerator.device).manual_seed(
+                        self.args.seed if self.args.seed is not None else 0
+                    ),
+                )
+
+            else:
+                validation_artifacts = self.model_config["validation"](
+                    pipeline=pipeline,
+                    prompt=prompt,
+                    image=image,
+                    video=video,
+                    height=height,
+                    width=width,
+                    num_frames=num_frames,
+                    frame_rate=frame_rate,
+                    num_videos_per_prompt=self.args.num_validation_videos_per_prompt,
+                    generator=torch.Generator(device=accelerator.device).manual_seed(
+                        self.args.seed if self.args.seed is not None else 0
+                    ),
+                    # todo support passing `fps` for supported pipelines.
+                )
 
             prompt_filename = string_to_filename(prompt)[:25]
             artifacts = {
@@ -1182,3 +1349,54 @@ class Trainer:
         for component in components:
             if component is not None:
                 component.requires_grad_(True)
+
+    
+    # Two conditioning functions
+    @staticmethod
+    def preprocess_condition_video(path: Path,max_num_frames:int) -> Tuple[torch.Tensor, Optional[torch.Tensor]]:
+        r"""
+        Loads a single video, or latent and prompt embedding, based on initialization parameters.
+
+        Returns a [F, C, H, W] video tensor.
+        """
+        video_reader = decord.VideoReader(uri=Path(path).as_posix())
+        video_num_frames = len(video_reader)
+
+        indices = list(range(0, video_num_frames, video_num_frames // max_num_frames))
+        frames = video_reader.get_batch(indices)
+        frames = frames[: max_num_frames].float()
+        frames = frames.permute(0, 3, 1, 2).contiguous()
+        frames = torch.stack([frame for frame in frames], dim=0)
+        # add singleton dimension for downstream inference since no preprocessing took place
+        frames = frames.unsqueeze(0)
+        return frames
+    
+    @staticmethod
+    def preprocess_condition_video_image_reference_video(path: Path,resolution_buckets,max_num_frames) -> torch.Tensor:
+        video_reader = decord.VideoReader(uri=Path(path).as_posix())
+
+        video_num_frames = len(video_reader)
+        nearest_frame_bucket = min(
+            [bucket for bucket in resolution_buckets if bucket[0] <= video_num_frames],
+            key=lambda x: abs(x[0] - min(video_num_frames, max_num_frames)),
+            default=1,
+        )[0]
+
+        frame_indices = [0 for _ in range(video_num_frames)]
+        frames = video_reader.get_batch(frame_indices)
+        frames = frames[:nearest_frame_bucket].float()
+
+        frames = frames.permute(0, 3, 1, 2).contiguous()
+
+        # nearest_res = self._find_nearest_resolution(frames.shape[2], frames.shape[3])
+        # frames_resized = torch.stack([frame for frame in frames], dim=0)
+        frames = torch.stack([frame for frame in frames], dim=0)
+        # adding singleton dimension for downstream inference.
+        frames = frames.unsqueeze(0)
+        return frames
+    
+    @staticmethod
+    def _find_nearest_resolution(resolutions, height, width):
+        nearest_res = min(resolutions, key=lambda x: abs(x[1] - height) + abs(x[2] - width))
+        return nearest_res[1], nearest_res[2]
+    
